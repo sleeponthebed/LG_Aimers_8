@@ -1,0 +1,259 @@
+!pip install -U accelerate peft bitsandbytes datasets
+
+
+!pip install -U "transformers==4.57.3"
+!pip install git+https://github.com/lgai-exaone/transformers@add-exaone4
+
+
+# !pip install huggingface_hub
+from huggingface_hub import login
+
+login(token='...')
+
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+
+model_dir = '...'
+
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",      # QLoRA 핵심, int4보다 normalfloat4가 원 분포를 더 잘 반영, QLoRA의 기본 recipe
+    bnb_4bit_use_double_quant=True, # 메타 정보 같은 것들까지 이중 양자화
+    bnb_4bit_compute_dtype=torch.bfloat16 # 학습 연산 시 내부적으로 사용하는 dtype(학습 안정성)
+)
+
+
+tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_dir,
+    quantization_config=bnb_config,
+    device_map="auto",
+    torch_dtype=torch.bfloat16
+)
+
+model.config.use_cache = False
+model.gradient_checkpointing_enable()
+
+
+from peft import LoraConfig, get_peft_model
+from peft import prepare_model_for_kbit_training
+
+lora_config = LoraConfig(
+    r=8,                            # Adapter dimension
+    lora_alpha=16,                  # hyperparameter
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj"],  # Transformer 핵심
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_L
+)
+
+model = prepare_model_for_kbit_training(model)  # 4bit 양자화 모델 보호
+model = get_peft_model(model, lora_config)
+model.print_trainable_parameters()
+
+
+from datasets import load_dataset
+
+raw_dataset = load_dataset("LGAI-EXAONE/MANTA-1M", split="train")
+
+# 너무 데이터가 커서 일부만 shuffle해서 활용
+raw_dataset = raw_dataset.shuffle(seed=42).select(range(30000))
+
+split = raw_dataset.train_test_split(test_size=0.05, seed=42)
+
+train_raw = split["train"]
+val_raw   = split["test"]
+
+
+print(train_raw.column_names)
+print(train_raw[0])
+
+
+def format_example(example):
+    text = tokenizer.apply_chat_template(
+        example["conversations"],
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+    return {"text": text}
+
+train_text = train_raw.map(
+    format_example,
+    remove_columns=train_raw.column_names,
+)
+
+val_text = val_raw.map(
+    format_example,
+    remove_columns=val_raw.column_names,
+)
+
+
+MAX_LEN = 2048
+
+def tokenize_fn(example):
+    tok = tokenizer(
+        example["text"],
+        truncation=True,
+        max_length=MAX_LEN,
+        padding=False,
+    )
+    tok["labels"] = tok["input_ids"].copy()
+    return tok
+
+
+train_dataset = train_text.map(
+    tokenize_fn,
+    remove_columns=train_text.column_names,
+)
+
+val_dataset = val_text.map(
+    tokenize_fn,
+    remove_columns=val_text.column_names,
+)
+
+
+def has_supervision(ex):
+    return any(l != -100 for l in ex["labels"])
+
+train_dataset = train_dataset.filter(has_supervision)
+val_dataset   = val_dataset.filter(has_supervision)
+
+
+
+import torch
+
+class DataCollatorForCausalLM_Safe:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        self.pad_token_id = tokenizer.pad_token_id
+
+    def __call__(self, features):
+        # labels를 먼저 분리
+        labels = [f.pop("labels") for f in features]
+
+        # input_ids / attention_mask만 tokenizer.pad로 처리
+        batch = self.tokenizer.pad(
+            features,
+            padding=True,
+            return_tensors="pt",
+        )
+
+        # labels를 직접 padding (-100)
+        max_len = batch["input_ids"].size(1)
+        padded_labels = torch.full(
+            (len(labels), max_len),
+            fill_value=-100,
+            dtype=torch.long,
+        )
+
+        for i, lab in enumerate(labels):
+            lab = torch.tensor(lab, dtype=torch.long)
+            padded_labels[i, : lab.size(0)] = lab
+
+        batch["labels"] = padded_labels
+        return batch
+
+
+from transformers import TrainingArguments, Trainer
+
+data_collator = DataCollatorForCausalLM_Safe(tokenizer)
+
+
+training_args = TrainingArguments(
+    output_dir="./qlora_out",
+
+    per_device_train_batch_size=2,
+    per_device_eval_batch_size=2,
+    gradient_accumulation_steps=8,
+
+    learning_rate=2e-4,
+    num_train_epochs=1,   # 2 이상은 너무 시간이 오래걸려 일단 1로 설정
+
+    bf16=True,
+
+    logging_steps=20,
+
+    # validation loss 핵심
+    eval_strategy="steps",
+    eval_steps=200,
+
+    save_strategy="steps",
+    save_steps=200,
+
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_loss",
+    greater_is_better=False,
+
+    optim="paged_adamw_8bit",
+    report_to="none",
+)
+
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    data_collator=data_collator,
+)
+
+trainer.train()
+
+
+model.save_pretrained("/content/drive/MyDrive/QLoRA_Adapters/sft_qlora_MANTA_1M")
+tokenizer.save_pretrained("/content/drive/MyDrive/QLoRA_Adapters/sft_qlora_MANTA_1M")
+
+
+import os
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel
+
+BASE_DIR = "/content/drive/MyDrive/sft_models/exaone_sft_v3"        # 베이스 모델
+ADAPTER_DIR = "/content/drive/MyDrive/QLoRA_Adapters/sft_qlora_MANTA_1M"  # 어댑터
+OUT_DIR = "/content/drive/MyDrive/sft_models/exaone_merged_sft_qlora" # 출력
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# 1) tokenizer는 보통 base에서 읽고, OUT_DIR에 저장
+tokenizer = AutoTokenizer.from_pretrained(BASE_DIR, use_fast=True, trust_remote_code=True)
+
+# pad_token 안전 처리 (없으면 eos로)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+# 2) 베이스 모델을 fp16/bf16로 로드 (fp16 권장)
+dtype = torch.float16
+base = AutoModelForCausalLM.from_pretrained(
+    BASE_DIR,
+    torch_dtype=dtype,
+    device_map="auto",
+    trust_remote_code=True,
+)
+
+# 3) LoRA 어댑터를 붙임
+peft_model = PeftModel.from_pretrained(base, ADAPTER_DIR)
+
+# 4) merge + LoRA 레이어 제거(= 순수 모델로 만듦)
+merged = peft_model.merge_and_unload()
+
+# 5) config / 토큰 관련 세팅
+merged.config.use_cache = True
+merged.config.pad_token_id = tokenizer.pad_token_id
+
+# 6) 저장 (safetensors로)
+merged.save_pretrained(OUT_DIR, safe_serialization=True)
+tokenizer.save_pretrained(OUT_DIR)
+
+print("Merged model saved to:", OUT_DIR)
