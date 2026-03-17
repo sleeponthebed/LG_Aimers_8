@@ -1,0 +1,162 @@
+# !pip install huggingface_hub
+from huggingface_hub import login
+
+login(token='...')
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+
+!pip install vllm
+!pip install langchain langchain_core langchain_openai
+
+
+import os, textwrap, subprocess, time, signal
+
+MODEL_PATH = "/content/drive/MyDrive/GPTQ_models/smooth_35_1024"
+SERVED_NAME = "gptq_model"
+PORT = 8000
+
+cmd = [
+    "python", "-m", "vllm.entrypoints.openai.api_server",
+    "--model", MODEL_PATH,
+    "--served-model-name", SERVED_NAME,
+    "--host", "0.0.0.0",
+    "--port", str(PORT),
+    "--dtype", "bfloat16",
+    "--max-model-len", "4096",
+    "--gpu-memory-utilization", "0.85",
+    "--api-key", "token-abc123"
+]
+
+# 중복 실행 방지 체크
+print("Launching vLLM server...")
+proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+!ps aux | egrep "vllm|api_server|EngineCore" | grep -v egrep
+!nvidia-smi -L
+
+
+from datasets import load_dataset
+
+ds = load_dataset("LGAI-EXAONE/KoMT-Bench")
+test = ds["test"] if "test" in ds else ds["train"]  # split이 다를 수 있어 안전 처리
+
+print(ds)
+print("N:", len(test))
+print("keys:", test.column_names)
+print("sample turns:", test[0]["turns"] if "turns" in test.column_names else None)
+print("sample category:", test[0].get("category", None))
+
+
+from langchain_openai import ChatOpenAI
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+
+BASE_URL = "http://localhost:8000/v1"
+API_KEY = "token-abc123"
+MODEL_NAME = SERVED_NAME # served-model-name
+
+SYSTEM = "당신은 도움이 되는 한국어 어시스턴트입니다. 질문 의도를 정확히 파악하고, 간결하지만 충분히 설명하세요."
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", SYSTEM),
+    ("user", "{user_msg}")
+])
+
+llm = ChatOpenAI(
+    model=MODEL_NAME,
+    base_url=BASE_URL,
+    api_key=API_KEY,
+    temperature=0.7,
+    max_tokens=1024,
+)
+
+chain = prompt | llm | StrOutputParser()
+
+# sanity
+print(chain.invoke({"user_msg": "안녕하세요! 한 문장으로 자기소개 해줘."}))
+
+
+import asyncio
+from tqdm import tqdm
+
+# KoMT-Bench의 턴 컬럼명 지정(대부분 turns)
+TURN_COL = "turns"  # 만약 다르면 여기만 수정
+
+async def run_komtbench_2turn(test_split, limit=None, print_every=10):
+    n = len(test_split) if limit is None else min(limit, len(test_split))
+    outputs = []
+    for i in tqdm(range(n), desc="KoMT-Bench"):
+        turns = test_split[i][TURN_COL]  # ["1st turn", "2nd turn"]
+        turn1 = turns[0]
+        turn2 = turns[1] if len(turns) > 1 else ""
+
+        # 1) turn1 응답 생성
+        a1 = await chain.ainvoke({"user_msg": turn1})
+
+        # 2) turn2는 컨텍스트 포함해서 응답 생성
+        #    (간단 MT-bench 스타일: 이전 Q/A를 user 메시지에 포함)
+        followup_context = (
+            f"[1턴 질문]\n{turn1}\n\n"
+            f"[1턴 답변]\n{a1}\n\n"
+            f"[2턴 질문]\n{turn2}"
+        )
+        a2 = await chain.ainvoke({"user_msg": followup_context}) if turn2.strip() else ""
+
+        rec = {
+            "idx": i,
+            "id": test_split[i].get("question_id", test_split[i].get("id", i)),
+            "category": test_split[i].get("category", None),
+            "turn1": turn1,
+            "answer1": a1,
+            "turn2": turn2,
+            "answer2": a2,
+        }
+        outputs.append(rec)
+
+        if (i % print_every) == 0:
+            print("\n" + "="*90)
+            print(f"IDX {i} | category={rec['category']} | id={rec['id']}")
+            print("\n[Turn1]\n", turn1)
+            print("\n[Answer1]\n", a1[:1200])
+            if turn2.strip():
+                print("\n[Turn2]\n", turn2)
+                print("\n[Answer2]\n", a2[:1200])
+
+    return outputs
+
+# 실행
+# limit=숫자에 따른 소량 테스트도 가능
+results = await run_komtbench_2turn(test, limit=None, print_every=1)
+print("Done:", len(results))
+
+
+import json
+import os
+from datetime import datetime
+
+def save_results_to_drive(results, filename=None, folder="LLM_results"):
+    # 기본 저장 경로
+    base_path = f"/content/drive/MyDrive/{folder}"
+    os.makedirs(base_path, exist_ok=True)
+
+    # 파일명 자동 생성
+    if filename is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"komtbench_results_{timestamp}.json"
+
+    full_path = os.path.join(base_path, filename)
+
+    with open(full_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+
+    print(f"Saved to: {full_path}")
+    return full_path
+
+
+save_results_to_drive(
+    results,
+    filename="komtbench_w8a8_smooth_35_1024.json"
+)
